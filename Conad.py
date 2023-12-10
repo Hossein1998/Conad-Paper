@@ -16,20 +16,9 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 import networkx as nx
 from tqdm import tqdm
-import torch.nn.functional as F
-import dgl
-import os
-import numpy as np
-import networkx as nx
-from scipy.sparse import data
-import torch
-import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
-import scipy.io
-import scipy.sparse as sparse
-from scipy.sparse import linalg
-from scipy.linalg import inv, fractional_matrix_power
-
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, roc_curve
+import community as community_louvain
+red = "\033[0;31m"
 
 
 
@@ -47,53 +36,132 @@ def load_anomaly_detection_dataset(dataset):
     return adj, feat, truth
 
 
-def make_anomalies(adj, feat, rate=.1, clique_size=30, sourround=50, scale_factor=10):
+
+def make_anomalies(adj, feat, rate=.3, sourround=50, scale_factor=10, noise_level=0.2):
     # Convert feat_aug to float64
     adj_aug, feat_aug = adj.copy(), feat.copy().astype('float64')
     label_aug = np.zeros(adj.shape[0])
-    assert(adj_aug.shape[0]==feat_aug.shape[0])
+    assert(adj_aug.shape[0] == feat_aug.shape[0])
     num_nodes = adj_aug.shape[0]
+
+    # Calculate average degree of the network
+    avg_degree = np.mean(np.sum(adj, axis=1))
+
+    # Convert adj to graph and perform community detection
+    G = nx.from_numpy_array(adj)
+    communities = community_louvain.best_partition(G)
+
     for i in range(num_nodes):
         prob = np.random.uniform()
-        if prob > rate: continue
+        if prob > rate:
+            continue
         label_aug[i] = 1
-        one_fourth = np.random.randint(0, 4)
-        if one_fourth == 0:
-            # add clique
-            degree = np.sum(adj[i])
-            max_clique_size=30
-            new_neighbors = np.random.choice(np.arange(num_nodes), clique_size, replace=False)
-            for n in new_neighbors:
-                adj_aug[n][i] = 1
-                adj_aug[i][n] = 1
-        elif one_fourth == 1:
-            # drop all connection
+
+        # Randomly choose a type of anomaly
+        anomaly_type = np.random.randint(0, 8)  # Adjusted to include new anomaly type
+
+        # anomaly_type = 8
+
+        if anomaly_type == 0:
+            # Add clique
+            min_clique_size = max(3, int(avg_degree * 0.5))
+            max_clique_size = max(min_clique_size + 1, int(avg_degree * 1.5))
+            clique_size = np.random.randint(min_clique_size, max_clique_size)
+            less_connected_nodes = np.where(np.sum(adj, axis=1) < avg_degree)[0]
+            if len(less_connected_nodes) > 0:
+                node_for_clique = np.random.choice(less_connected_nodes)
+                new_neighbors = np.random.choice(np.arange(num_nodes), clique_size, replace=False)
+                for n in new_neighbors:
+                    if n != node_for_clique:
+                        adj_aug[n][node_for_clique] = 1
+                        adj_aug[node_for_clique][n] = 1
+
+        elif anomaly_type == 1:
+            # Selective and Partial Edge Dropping
             neighbors = np.nonzero(adj[i])[0]
-            if neighbors.size == 0:
-                    continue
-            elif neighbors.size == 1:
-                    neighbors = [neighbors.item()]
-            for n in neighbors:
-                adj_aug[i][n] = 0
-                adj_aug[n][i] = 0
-        elif one_fourth == 2:
-            # attrs
-            candidates = np.random.choice(np.arange(num_nodes), sourround, replace=False)
-            max_dev, max_idx = 0, i
-            for c in candidates:
-                dev = np.square(feat[i]-feat[c]).sum()
-                if dev > max_dev:
-                    max_dev = dev
-                    max_idx = c
-            feat_aug[i] = feat[max_idx]
-        else:
-            # scale attr
-            prob = np.random.uniform(0, 1)
-            if prob > 0.5:
-                feat_aug[i] *= scale_factor
-            else:
-                feat_aug[i] /= scale_factor
-    return adj_aug, feat_aug, label_aug
+            if neighbors.size > 0:
+                proportion_to_drop = 0.5
+                num_edges_to_drop = int(proportion_to_drop * len(neighbors))
+                neighbor_degrees = np.sum(adj[neighbors, :], axis=1)
+                neighbors_sorted_by_degree = neighbors[np.argsort(-neighbor_degrees)]
+                edges_to_drop = neighbors_sorted_by_degree[:num_edges_to_drop]
+                for n in edges_to_drop:
+                    adj_aug[i][n] = 0
+                    adj_aug[n][i] = 0
+
+        elif anomaly_type == 2:
+            # Contextual Attribute Modification and Combining Attribute Changes
+            non_neighbors_mask = np.sum(adj[i] + adj[:, i], axis=0) == 0
+            non_neighbors = np.atleast_1d(non_neighbors_mask).nonzero()[0]
+            direct_neighbors_mask = adj[i].astype(bool)
+            direct_neighbors = np.atleast_1d(direct_neighbors_mask).nonzero()[0]
+            candidates = np.concatenate([non_neighbors, direct_neighbors]) if len(direct_neighbors) > 0 else non_neighbors
+            if len(candidates) > 0:
+                chosen_node = np.random.choice(candidates)
+                num_attrs = feat_aug.shape[1]
+                selected_attrs = np.random.choice(num_attrs, num_attrs // 2, replace=False)
+                feat_aug[i, selected_attrs] = feat[chosen_node, selected_attrs]
+
+        elif anomaly_type == 3:
+            # Selective Scaling and Non-Uniform Scaling of Attributes
+            num_attrs = feat_aug.shape[1]
+            attr_variance = np.var(feat_aug, axis=0)
+            important_attrs = np.argsort(-attr_variance)[:num_attrs // 2]
+            for attr in important_attrs:
+                scale_factor_attr = np.random.uniform(0.5, 1.5)
+                feat_aug[i, attr] *= scale_factor_attr
+            remaining_attrs = [attr for attr in range(num_attrs) if attr not in important_attrs]
+            for attr in remaining_attrs:
+                feat_aug[i, attr] *= scale_factor
+
+        elif anomaly_type == 4:
+            # Random Attribute Noise
+            noise_attrs = np.random.choice(feat_aug.shape[1], feat_aug.shape[1] // 2, replace=False)
+            noise = np.random.normal(0, noise_level, len(noise_attrs))
+            feat_aug[i, noise_attrs] += noise
+
+        elif anomaly_type == 5:
+            # Structural Anomaly - Breaking Community Structures
+            other_nodes = [node for node, comm in communities.items() if comm != communities[i]]
+            if other_nodes:
+                other_node = np.random.choice(other_nodes)
+                adj_aug[i, other_node] = 1
+                adj_aug[other_node, i] = 1
+
+        elif anomaly_type == 6:
+            # Structural Anomaly - Connecting Distant Nodes
+            non_neighbors_mask = np.sum(adj[i] + adj[:, i], axis=0) == 0
+            non_neighbors = np.atleast_1d(non_neighbors_mask).nonzero()[0]
+            if len(non_neighbors) > 0:
+                distant_node = np.random.choice(non_neighbors)
+                adj_aug[i, distant_node] = 1
+                adj_aug[distant_node, i] = 1
+
+        elif anomaly_type == 7:
+            # Random Edge Removal
+            non_neighbors_mask = np.sum(adj[i] + adj[:, i], axis=0) == 0
+            non_neighbors = np.atleast_1d(non_neighbors_mask).nonzero()[0]
+            if len(non_neighbors) > 0:
+                 distant_node = np.random.choice(non_neighbors)
+                 adj_aug[i, distant_node] = 1
+                 adj_aug[distant_node, i] = 1
+                
+        elif anomaly_type == 8:
+            # Creating Isolated Subgraphs (Isolated Cliques)
+            clique_size = np.random.randint(3, 6)  # Choose the clique size
+            clique_nodes = np.random.choice(num_nodes, clique_size, replace=False)
+            for node in clique_nodes:
+                adj_aug[node, :] = 0
+                adj_aug[:, node] = 0
+                
+            for node1 in clique_nodes:
+                for node2 in clique_nodes:
+                    if node1 != node2:
+                         adj_aug[node1, node2] = 1
+
+     
+    return adj_aug, feat_aug, label_aug, anomaly_type
+
 
 
 
@@ -129,8 +197,8 @@ class GRL(nn.Module):
         )
         self.attr_decoder = GraphConv(
             in_feats=out_dim,
-            out_feats=in_dim,
-            #activation=torch.sigmoid,
+            out_feats=in_dim
+            # activation=torch.sigmoid,
         )
         self.struct_decoder = nn.Sequential(
             Reconstruct(),
@@ -162,6 +230,7 @@ class GRL(nn.Module):
         return struct_reconstructed, x_hat
 
 
+
 def loss_func(a, a_hat, x, x_hat, weight1=1, weight2=1, alpha=0.6, mask=1):
     # adjacency matrix reconstruction
     struct_weight = weight1
@@ -178,9 +247,7 @@ def loss_func(a, a_hat, x, x_hat, weight1=1, weight2=1, alpha=0.6, mask=1):
     return loss, struct_error_mean, feat_error_mean
 
 
-
-
-dataset = "Amazon"  
+dataset = "Flickr"  
 cuda = True
 epoch1 = 200
 lr = 1e-3
@@ -201,27 +268,34 @@ hidden_dim, out_dim = 128, 64
 hidden_num = 2
 
 model = GRL(num_attr, hidden_dim, out_dim, hidden_num)
- 
+
 
 
 def criterion(z, z_hat, y, margin):
-    n = len(z)
-    total_loss = 0.0
-    _list = []
+    # Vectorized computation of squared differences
+    diff_squared = (z - z_hat) ** 2
 
-    for i in range(n):
-        diff_squared = (z[i] - z_hat[i]) ** 2
-        _list.append(diff_squared)
+    # Sum over the feature dimension to get a 1D tensor
+    diff_squared = diff_squared.sum(dim=1)
 
-        if y[i] == 0:
-            loss = diff_squared
-        else:  # y[i] == 1
-            # Soft margin modification
-            loss = F.softplus(margin - diff_squared)
+    # Ensure y is a 1D tensor
+    y = y.squeeze()
 
-        total_loss += loss
+    # Create masks for different conditions
+    anomaly_mask = y == 1
+    normal_mask = ~anomaly_mask
 
-    return total_loss / n, _list
+    # Apply conditions using masks
+    loss_normal = diff_squared[normal_mask]
+    loss_anomaly = F.softplus(margin - diff_squared[anomaly_mask])
+
+    # Combine losses
+    total_loss = torch.cat((loss_normal, loss_anomaly)).mean()
+
+    return total_loss
+
+
+
 
 cuda_device = torch.device('cuda') if cuda else torch.device('cpu')
 cpu_device = torch.device('cpu')
@@ -232,7 +306,9 @@ sw = SummaryWriter('logs/siamese_%s_%s' % (dataset, t))
 model.train()
 
 
-adj_aug, attrs_aug, label_aug = make_anomalies(adj, attrs, clique_size=20, sourround=50)
+adj_aug, attrs_aug, label_aug,i = make_anomalies(adj, attrs, sourround=50)
+
+print(i)
 
 graph2 = dgl.from_scipy(scipy.sparse.coo_matrix(adj_aug)).add_self_loop()
 attrs2 = torch.FloatTensor(attrs_aug)
@@ -251,13 +327,15 @@ for i in range(epoch1):
     # train siamese loss
     orig = model.embed(graph1, attrs1)
     aug = model.embed(graph2, attrs2)
-    margin_loss, _list = criterion(orig, aug, labels,margin)
-        
+    
+    margin_loss = criterion(orig,aug,labels,margin)
+    
+    
     margin_loss = margin_loss.mean()
     sw.add_scalar('train/margin_loss', margin_loss, i)
     
     margin_loss_number = margin_loss.detach().cpu().item()
-    if i % 5 == 0:
+    if i % 20 == 0:
         print(f'Epoch {i}: Margin Loss = {margin_loss_number}')
     
     optimizer.zero_grad()
@@ -265,7 +343,7 @@ for i in range(epoch1):
     optimizer.step()
 
     # train reconstruction
-    A_hat, X_hat = model(graph1, attrs1)
+    A_hat, X_hat = model(graph2, attrs2)
     a = graph1.adjacency_matrix().to_dense()
     recon_loss, struct_loss, feat_loss = loss_func(a.cuda() if cuda else a, A_hat, attrs1, X_hat, weight1=1, weight2=1, alpha=.7, mask=1)
     recon_loss = recon_loss.mean()
@@ -278,9 +356,8 @@ for i in range(epoch1):
     sw.add_scalar('train/feat_loss', feat_loss, i)
     
     recon_loss_number = recon_loss.detach().cpu().item()
-    if i % 5 == 0:
-        print(f'Epoch {i}: Margin Loss for reconstruction = {recon_loss_number}')
-    
+    if i % 20 == 0:
+        print(f'\033[91mEpoch {i}: Margin Loss for reconstruction = {recon_loss_number}\033[0m')   
     
 #print(_list[0])
 
@@ -291,6 +368,7 @@ with torch.no_grad():
     a = graph1.adjacency_matrix().to_dense().cpu()
     recon_loss, struct_loss, feat_loss = loss_func(a, A_hat, attrs1.cpu(), X_hat, weight1=1, weight2=1, alpha=.7)
     score = recon_loss.detach().numpy()
+    # score = (score - score.min()) / (score.max() - score.min())
     print('AUC: %.4f' % roc_auc_score(label, score))
     # for k in [50, 100, 200, 300]:
     #     print('Precision@%d: %.4f' % (k, precision_at_k(label, score, k)))
